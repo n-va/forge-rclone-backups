@@ -1,76 +1,71 @@
 #!/bin/bash
 
-# Exit immediately if a command exits with a non-zero status
-set -e
-
-# Create a temporary directory for the backup process
-temp_dir=$(mktemp -d)
-
-# Ensure the temporary directory is deleted on exit
-trap "rm -rf ${temp_dir}" EXIT
-
-# Create base directories for backups in the temporary directory
-mkdir -p "${temp_dir}/backup/sites"
-
-# Log file
+# Define variables
+current_date=$(date +%Y%m%d%H%M%S)
+hostname=$(hostname)
+backup_root="/tmp/backup-${current_date}"
 log_file="/var/log/s3-backup.log"
 
-# Redirect stdout and stderr to the log file
-exec > >(tee -i ${log_file})
-exec 2>&1
+# Create a temporary backup directory
+mkdir -p "${backup_root}/sites"
 
-echo "Backup started at $(date)"
+# Ensure the temporary directory is cleaned up on exit
+trap 'rm -rf ${backup_root}' EXIT
 
-# Get the server hostname
-hostname=$(hostname)
-
-# Get the current date and time in yyyyMMddHHmmss format
-current_datetime=$(date +%Y%m%d%H%M%S)
-
-# Iterate over each user's home directory
-for user_dir in /home/*; do
+# Start logging
+{
+  echo "Backup started at $(date)"
+  
+  # Iterate over each user directory in /home
+  for user_dir in /home/*; do
     if [ -d "${user_dir}" ]; then
-        echo "Processing user directory: ${user_dir}"
-
-        # Iterate over each site directory in the user's home directory
-        for site_dir in "${user_dir}"/*; do
-            if [ -d "${site_dir}/public" ]; then
-                echo "Found site directory: ${site_dir}/public"
-
-                # Get the site name from the directory name
-                site_name=$(basename "${site_dir}")
-
-                # Define the backup file name
-                backup_file="${temp_dir}/backup/sites/${site_name}.zip"
-
-                # Check if the wp-content directory exists inside public
-                if [ -d "${site_dir}/public/wp-content" ]; then
-                    echo "Found wp-content directory in: ${site_dir}/public"
-
-                    # Compress the wp-content directory into a zip file, excluding node_modules and vendor directories
-                    zip -rq "${backup_file}" "${site_dir}/public/wp-content" -x '*node_modules*' -x '*vendor*'
-                else
-                    echo "No wp-content directory found in ${site_dir}/public, zipping entire public directory"
-
-                    # Compress the entire public directory into a zip file, excluding node_modules and vendor directories
-                    zip -rq "${backup_file}" "${site_dir}/public" -x '*node_modules*' -x '*vendor*'
-                fi
-
-                # Define the S3 bucket path
-                s3_path="vultr-s3:content-backups/${hostname}/${current_datetime}/"
-
-                # Push the backup to Vultr Object Storage
-                rclone copy "${backup_file}" "${s3_path}"
-
-                # Delete the local backup file
-                rm "${backup_file}"
+      user=$(basename "${user_dir}")
+      
+      # Iterate over each site directory
+      for site_dir in "${user_dir}"/*.*; do
+        if [ -d "${site_dir}/public" ]; then
+          site=$(basename "${site_dir}")
+          site_backup_dir="${backup_root}/sites/${user}/${site}"
+          mkdir -p "${site_backup_dir}"
+          
+          echo "Processing ${user}/${site}..."
+          
+          # Check if wp-content exists
+          if [ -d "${site_dir}/public/wp-content" ]; then
+            zip_target="${site_backup_dir}/${site}.zip"
+            echo "Zipping wp-content for ${site}..."
+            zip -r "${zip_target}" "${site_dir}/public/wp-content" -x "${site_dir}/public/wp-content/node_modules/*" "${site_dir}/public/wp-content/vendor/*" >/dev/null 2>&1
+            if [ $? -ne 0 ]; then
+              echo "Error zipping wp-content for ${site}"
             else
-                echo "No 'public' directory found in ${site_dir}"
+              echo "Successfully zipped wp-content for ${site}"
             fi
-        done
-    else
-        echo "No user directory found: ${user_dir}"
+          else
+            zip_target="${site_backup_dir}/${site}.zip"
+            echo "Zipping entire public directory for ${site}..."
+            zip -r "${zip_target}" "${site_dir}/public" -x "${site_dir}/public/node_modules/*" "${site_dir}/public/vendor/*" >/dev/null 2>&1
+            if [ $? -ne 0 ]; then
+              echo "Error zipping public directory for ${site}"
+            else
+              echo "Successfully zipped public directory for ${site}"
+            fi
+          fi
+        fi
+      done
     fi
-done
+  done
+  
+  # Define S3 destination directory
+  s3_dest="vultr-s3:content-backups/${hostname}/${current_date}/"
 
-echo "Backup completed at $(date)"
+  # Copy the backup to S3
+  echo "Copying backup to S3..."
+  rclone copy "${backup_root}" "${s3_dest}" >/dev/null 2>&1
+  if [ $? -ne 0 ]; then
+    echo "Error copying backup to S3"
+  else
+    echo "Successfully copied backup to S3"
+  fi
+
+  echo "Backup completed at $(date)"
+} | tee -a "${log_file}"
